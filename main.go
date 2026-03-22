@@ -8,6 +8,7 @@ import (
     "sync"
     "sync/atomic"
     "time"
+    "runtime"
 
     "github.com/gen2brain/malgo"
 )
@@ -36,10 +37,17 @@ func main() {
         os.Exit(1)
     }
 
-    fmt.Fprintf(os.Stderr, "playing: %d Hz, %d ch, %d bit, %d bytes\n",
-        sampleRate, channels, bitsPerSample, len(pcmData))
-
-    ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+    var backends []malgo.Backend
+    switch runtime.GOOS {
+    case "darwin":
+        backends = []malgo.Backend{malgo.BackendCoreaudio}
+    case "windows":
+        backends = []malgo.Backend{malgo.BackendWasapi}
+    default:
+        backends = nil // let malgo pick
+    }
+    
+    ctx, err := malgo.InitContext(backends, malgo.ContextConfig{}, nil)
     if err != nil {
         fmt.Fprintf(os.Stderr, "malgo context error: %v\n", err)
         os.Exit(1)
@@ -53,15 +61,16 @@ func main() {
 
     bytesPerFrame := channels * (bitsPerSample / 8)
 
-    // Fix 1: use atomic int64 so the closure captures a pointer, not a value
     var offset atomic.Int64
-
-    // Fix 2: done channel — closed by callback when PCM is exhausted
-    var once sync.Once
-    done := make(chan struct{})
+    var once   sync.Once
+    done       := make(chan struct{})
 
     callbacks := malgo.DeviceCallbacks{
-        Data: func(_, pOut []byte, frameCount uint32) {
+        Data: func(pOut, _ []byte, frameCount uint32) {
+            if len(pOut) == 0 || frameCount == 0 {
+                return
+            }
+
             need      := int(frameCount) * bytesPerFrame
             cur       := int(offset.Load())
             available := len(pcmData) - cur
@@ -70,7 +79,6 @@ func main() {
                 for i := range pOut {
                     pOut[i] = 0
                 }
-                // Signal main goroutine that we are done
                 once.Do(func() { close(done) })
                 return
             }
@@ -79,7 +87,11 @@ func main() {
             if available < n {
                 n = available
             }
-            copy(pOut, pcmData[cur:cur+n])
+            if n > len(pOut) {
+                n = len(pOut)
+            }
+
+            copy(pOut[:n], pcmData[cur:cur+n])
             for i := n; i < len(pOut); i++ {
                 pOut[i] = 0
             }
@@ -99,14 +111,15 @@ func main() {
         os.Exit(1)
     }
 
-    // Fix 3: wait for the callback to signal completion rather than
-    // sleeping a calculated duration that may be wrong
+    totalFrames := len(pcmData) / bytesPerFrame
+    timeout := time.Duration(float64(time.Second)*
+        float64(totalFrames)/float64(sampleRate)) + 2*time.Second
+
     select {
     case <-done:
-        // Give the device one final buffer period to flush to hardware
-        time.Sleep(150 * time.Millisecond)
-    case <-time.After(5 * time.Minute):
-        // Safety timeout for very long files
+        time.Sleep(300 * time.Millisecond)
+    case <-time.After(timeout):
+        fmt.Fprintln(os.Stderr, "timeout waiting for playback")
     }
 }
 
